@@ -2,6 +2,7 @@
 input=$(cat)
 
 DATA_FILE="$HOME/.claude/statusline_data.json"
+STATS_CACHE="$HOME/.claude/stats-cache.json"
 TODAY=$(date +%Y-%m-%d)
 CURRENT_TIME=$(date +%H:%M)
 
@@ -81,30 +82,60 @@ fi
 DATA=$(cat "$DATA_FILE")
 
 # Update today's session cost
+# Use max of all sessions (not sum) to avoid double-counting cumulative costs
 DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '
     .days[$date].sessions[$sid] = $cost |
-    .days[$date].total = ([.days[$date].sessions[]] | add // 0)
+    .days[$date].total = ([.days[$date].sessions[]] | max // 0)
 ')
 
 # Save data
 echo "$DATA" > "$DATA_FILE"
 
-# Calculate daily, weekly, monthly costs
+# Calculate daily cost from session tracking
 DAILY_COST=$(echo "$DATA" | jq --arg date "$TODAY" '.days[$date].total // 0')
 
-# Weekly: sum last 7 days
-WEEKLY_COST=0
-for i in {0..6}; do
+# ===== HISTORICAL COSTS FROM STATS-CACHE =====
+# Calculate cost from token usage in stats-cache.json
+# Pricing per 1M tokens (output): Opus=$75, Sonnet=$15, Haiku=$4
+calc_historical_cost() {
+    local target_date="$1"
+    if [ ! -f "$STATS_CACHE" ]; then
+        echo "0"
+        return
+    fi
+
+    # Get tokens for this date from dailyModelTokens array
+    local day_data=$(jq -r --arg d "$target_date" '
+        .dailyModelTokens[] | select(.date == $d) | .tokensByModel // {}
+    ' "$STATS_CACHE" 2>/dev/null)
+
+    if [ -z "$day_data" ] || [ "$day_data" = "{}" ]; then
+        echo "0"
+        return
+    fi
+
+    # Calculate cost based on model (tokens are output tokens, price per 1M)
+    local cost=$(echo "$day_data" | jq '
+        ((.["claude-opus-4-5-20251101"] // 0) * 75 / 1000000) +
+        ((.["claude-sonnet-4-5-20250929"] // 0) * 15 / 1000000) +
+        ((.["claude-haiku-4-5-20251001"] // 0) * 4 / 1000000)
+    ')
+    echo "$cost"
+}
+
+# Weekly: today (from sessions) + last 6 days (from stats-cache)
+WEEKLY_COST=$DAILY_COST
+for i in {1..6}; do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    DAY_COST=$(echo "$DATA" | jq -r --arg d "$DATE" '.days[$d].total // 0')
+    DAY_COST=$(calc_historical_cost "$DATE")
     WEEKLY_COST=$(echo "$WEEKLY_COST + $DAY_COST" | bc)
 done
 
-# Monthly: sum last 30 days
-MONTHLY_COST=0
-for i in {0..29}; do
+# Monthly: today (from sessions) + last 29 days (from stats-cache)
+MONTHLY_COST=$DAILY_COST
+for i in {1..29}; do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    DAY_COST=$(echo "$DATA" | jq -r --arg d "$DATE" '.days[$d].total // 0')
+    DAY_COST=$(calc_historical_cost "$DATE")
     MONTHLY_COST=$(echo "$MONTHLY_COST + $DAY_COST" | bc)
 done
 
@@ -133,8 +164,8 @@ if [ -n "$GIT_BRANCH" ]; then
     OUTPUT+=" ${GREEN}🌿 ${GIT_BRANCH}${RESET}"
 fi
 
-# 💰 Costs: cur / 24h / 7d / 30d
-OUTPUT+=" ${DIM}💰 cur${RESET} ${YELLOW}\$${SESSION_FMT}${RESET} ${DIM}· 24h${RESET} ${MAGENTA}\$${DAILY_FMT}${RESET} ${DIM}· 7d${RESET} ${MAGENTA}\$${WEEKLY_FMT}${RESET} ${DIM}· 30d${RESET} ${MAGENTA}\$${MONTHLY_FMT}${RESET}"
+# 💰 Costs: session / today / 7d / 30d
+OUTPUT+=" ${DIM}💰 s${RESET} ${YELLOW}\$${SESSION_FMT}${RESET} ${DIM}· d${RESET} ${MAGENTA}\$${DAILY_FMT}${RESET} ${DIM}· w${RESET} ${MAGENTA}\$${WEEKLY_FMT}${RESET} ${DIM}· m${RESET} ${MAGENTA}\$${MONTHLY_FMT}${RESET}"
 
 # 🕐 Time
 OUTPUT+=" ${DIM}🕐 ${CURRENT_TIME}${RESET}"
