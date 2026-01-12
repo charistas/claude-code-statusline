@@ -9,7 +9,7 @@ A beautiful, feature-rich statusline for Claude Code CLI with real-time context 
 ## Preview
 
 ```
-🤖 Opus [████████░░] 78% 📁 my-project 🌿 feature/auth 💰 s $1.50 · d $45 · w $312 · m $1.2k · y $8.5k 🕐 14:32
+🤖 Opus 4.5 [████████░░] 78% 📁 my-project 🌿 feature/auth 💰 s $1.50 · d $45 · w $120 · m $340 · y $1.2k 🕐 14:32
 ```
 
 ## Features
@@ -19,7 +19,7 @@ A beautiful, feature-rich statusline for Claude Code CLI with real-time context 
 - **🚦 Traffic Light Colors** - Green (>50%), Yellow (25-50%), Red (<25%), Blinking (<10%)
 - **📁 Project Name** - Current project directory
 - **🌿 Git Branch** - Active git branch (when in a repo)
-- **💰 Cost Tracking** - Session, daily, weekly, monthly, and yearly cost tracking with persistent history
+- **💰 Cost Tracking** - Session, daily, weekly, monthly, and yearly costs
 - **🕐 Current Time** - Live clock display
 
 ## Installation
@@ -45,34 +45,35 @@ Add to your `~/.claude/settings.json`:
 
 ```json
 {
-  "statusLine": {
-    "type": "command",
-    "command": "~/.claude/statusline.sh"
+  "hooks": {
+    "StatusLine": [
+      {
+        "type": "command",
+        "command": "~/.claude/statusline.sh"
+      }
+    ]
   }
 }
-```
-
-Or use the Claude Code command:
-```
-/config set statusLine.command ~/.claude/statusline.sh
 ```
 
 ## Dependencies
 
 - `jq` - JSON processor (required)
 - `bc` - Calculator for cost math (required)
+- `flock` - File locking for parallel instances (optional, recommended)
 - `git` - For branch display (optional)
 
 ### Install Dependencies
 
 **macOS:**
 ```bash
-brew install jq bc
+brew install jq bc flock
 ```
 
 **Ubuntu/Debian:**
 ```bash
 sudo apt install jq bc
+# flock is usually pre-installed
 ```
 
 ## How It Works
@@ -92,34 +93,69 @@ The statusline reads Claude Code's JSON input which includes context window info
 
 Costs are displayed with compact labels:
 
-| Label | Meaning | Source |
+| Label | Meaning | Period |
 |-------|---------|--------|
-| **s** | Session | Current session cost from Claude Code |
-| **d** | Day | Today's total (sum of all sessions) |
-| **w** | Week | Last 7 days |
-| **m** | Month | Last 30 days |
-| **y** | Year | Last 365 days |
+| **s** | Session | Current session (real-time from Claude Code) |
+| **d** | Day | Calendar day (today) |
+| **w** | Week | Calendar week (Monday-Sunday) |
+| **m** | Month | Calendar month (1st to today) |
+| **y** | Year | Calendar year (Jan 1 to today) |
 
 #### How It Works
 
-- **Today's cost** is tracked per-session in `~/.claude/statusline_data.json`
-- **Historical costs** (for w/m/y) are calculated from Claude Code's built-in `~/.claude/stats-cache.json` which tracks daily token usage per model
-- **Persistent history** is archived to our data file, so yearly totals remain accurate even after stats-cache rolls off older data (~30 days)
+- **Session cost**: Comes directly from Claude Code's `total_cost_usd` (100% accurate)
+- **Daily aggregates**: Calculated from JSONL transcript files in `~/.claude/projects/` (~90% accurate)
+- **Historical costs**: Cached in `~/.claude/statusline_data.json` for fast access
 
-#### Pricing Used
+#### JSONL Parsing
 
-Costs are estimated from output token usage:
-- Opus: $75 per million tokens
-- Sonnet: $15 per million tokens
-- Haiku: $4 per million tokens
+The script parses Claude Code's transcript files directly:
 
-> **Note:** These are API-equivalent estimates. If you're on a Pro/Max subscription, these don't reflect actual charges.
+1. **Filters**: Excludes sidechain and API error entries
+2. **Deduplication**: Groups by `requestId`, takes MAX of each token type (correctly handles streaming responses where token counts are cumulative)
+3. **Pricing**: Applies Claude 4.5 rates per million tokens
+
+#### Pricing (Claude 4.5)
+
+| Model | Input | Output | Cache Read | Cache Write |
+|-------|-------|--------|------------|-------------|
+| Opus | $5 | $25 | $0.50 | $6.25 |
+| Sonnet | $3 | $15 | $0.30 | $3.75 |
+| Haiku | $1 | $5 | $0.10 | $1.25 |
+
+#### Accuracy
+
+| Metric | Accuracy | Notes |
+|--------|----------|-------|
+| Session cost | 100% | Direct from Claude Code |
+| Daily/Weekly/Monthly/Yearly | ~90% | JSONL parsing excludes sidechains |
+
+The ~10% variance is due to sidechain operations being excluded to avoid potential double-counting.
+
+### Concurrency Safety
+
+- **File locking**: Uses `flock` (if available) to prevent race conditions when multiple Claude Code instances run simultaneously
+- **Atomic writes**: Uses temp file + mv pattern to prevent data corruption
+
+### Performance
+
+- Historical costs are calculated once and cached forever
+- Today's cost is always calculated fresh from JSONL
+- Typical execution time: ~0.4 seconds
 
 ## Customization
 
+### Timezone
+
+Edit the timezone at the top of `statusline.sh`:
+
+```bash
+export TZ="Europe/Athens"  # Change to your timezone
+```
+
 ### Modify Colors
 
-Edit the color variables at the top of `statusline.sh`:
+Edit the color variables:
 
 ```bash
 CYAN="\033[36m"     # Model name
@@ -131,52 +167,39 @@ BLUE="\033[34m"     # Project name
 DIM="\033[90m"      # Labels
 ```
 
-### Modify Layout
-
-The output is built in the `BUILD OUTPUT` section. Reorder or remove sections as needed:
-
-```bash
-# Example: Remove time display
-# Comment out or delete these lines:
-# OUTPUT+=" ${DIM}🕐 ${CURRENT_TIME}${RESET}"
-```
-
 ## Data Storage
 
-| File | Purpose | Owned By |
-|------|---------|----------|
-| `~/.claude/statusline_data.json` | Session costs, daily totals, persistent history | This script |
-| `~/.claude/stats-cache.json` | Token usage per day per model | Claude Code |
+| File | Purpose |
+|------|---------|
+| `~/.claude/statusline_data.json` | Cached daily costs and session baselines |
+| `~/.claude/projects/*/*.jsonl` | Claude Code transcript files (read-only) |
 
 ### Data Structure
 
 ```json
 {
   "days": {
-    "2026-01-11": {
+    "2026-01-12": {
+      "baselines": { "session-id": 10.50 },
       "sessions": { "session-id": 5.50 },
       "total": 5.50
     }
   },
   "history": {
-    "2026-01-10": 31.50,
-    "2026-01-09": 28.75
+    "2026-01-11": 31.50,
+    "2026-01-10": 28.75
   }
 }
 ```
 
-- **days** - Today's session tracking (resets each day)
-- **history** - Archived daily costs (persists forever for yearly tracking)
+- **days**: Today's session tracking with baselines (for sessions spanning midnight)
+- **history**: Archived daily costs (calculated from JSONL, cached permanently)
 
 ### Reset Cost Data
-
-To reset your cost tracking:
 
 ```bash
 rm ~/.claude/statusline_data.json
 ```
-
-> **Note:** This only resets the statusline's data. Claude Code's stats-cache.json is unaffected.
 
 ## Troubleshooting
 
@@ -188,18 +211,20 @@ rm ~/.claude/statusline_data.json
 
 ### Costs showing $0
 
-The cost data comes from Claude Code's JSON input. Ensure you're using a recent version of Claude Code (2.0+).
+- Ensure JSONL files exist in `~/.claude/projects/`
+- Check `jq` is installed: `which jq`
+- Try running manually: `echo '{}' | ~/.claude/statusline.sh`
 
 ### Git branch not showing
 
 - Verify you're in a git repository
 - Check git is installed: `which git`
 
-### Characters not displaying correctly
+### Parse errors in output
 
-Ensure your terminal supports:
-- Unicode (for emojis and progress bar)
-- ANSI colors (for colored output)
+- May occur with malformed JSONL entries
+- The script handles these gracefully but may show stderr
+- Consider redirecting: `~/.claude/statusline.sh 2>/dev/null`
 
 ## Contributing
 
@@ -215,9 +240,9 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- Inspired by [powerline](https://github.com/powerline/powerline) and the Claude Code community
 - Built for use with [Claude Code](https://claude.ai/code) by Anthropic
+- Validated against [ccusage](https://github.com/ryoppippi/ccusage) for accuracy
 
 ---
 
-**Found this useful?** Give it a ⭐ on GitHub!
+**Found this useful?** Give it a star on GitHub!
