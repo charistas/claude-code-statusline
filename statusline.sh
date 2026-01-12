@@ -175,25 +175,32 @@ get_historical_cost() {
     calc_cost_from_stats "$target_date"
 }
 
-# Weekly: today (from sessions) + last 6 days (from history/stats-cache)
+# Weekly: Calendar week (Monday-Sunday)
+# Find days since last Monday (0=Mon, 1=Tue, ..., 6=Sun)
+DAY_OF_WEEK=$(date +%u)  # 1=Mon, 7=Sun
+DAYS_SINCE_MONDAY=$((DAY_OF_WEEK - 1))
+
 WEEKLY_COST=$DAILY_COST
-for i in {1..6}; do
+for ((i=1; i<=DAYS_SINCE_MONDAY; i++)); do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
     DAY_COST=$(get_historical_cost "$DATE")
     WEEKLY_COST=$(echo "$WEEKLY_COST + $DAY_COST" | bc)
 done
 
-# Monthly: today (from sessions) + last 29 days (from history/stats-cache)
+# Monthly: Calendar month (1st to today)
+DAY_OF_MONTH=$(date +%d | sed 's/^0//')  # Remove leading zero
+DAYS_SINCE_FIRST=$((DAY_OF_MONTH - 1))
+
 MONTHLY_COST=$DAILY_COST
-for i in {1..29}; do
+for ((i=1; i<=DAYS_SINCE_FIRST; i++)); do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
     DAY_COST=$(get_historical_cost "$DATE")
     MONTHLY_COST=$(echo "$MONTHLY_COST + $DAY_COST" | bc)
 done
 
-# Yearly: sum all history entries from last 365 days + today
-YEAR_AGO=$(date -v-365d +%Y-%m-%d 2>/dev/null || date -d "-365 days" +%Y-%m-%d 2>/dev/null)
-YEARLY_HISTORY=$(echo "$DATA" | jq --arg cutoff "$YEAR_AGO" '
+# Yearly: Calendar year (Jan 1 to today)
+YEAR_START=$(date +%Y)-01-01
+YEARLY_HISTORY=$(echo "$DATA" | jq --arg cutoff "$YEAR_START" '
     [.history | to_entries[] | select(.key >= $cutoff) | .value] | add // 0
 ')
 YEARLY_COST=$(echo "$DAILY_COST + $YEARLY_HISTORY" | bc)
