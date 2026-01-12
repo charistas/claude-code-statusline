@@ -99,8 +99,15 @@ elif [ -d ".git" ]; then
     GIT_BRANCH=$(git branch --show-current 2>/dev/null)
 fi
 
-# ===== AUTO-COMPACT DETECTION =====
-# Load previous token state for this session (need data file early for this)
+# ===== CONTEXT TRACKING & RESET DETECTION =====
+# Claude Code reports cumulative session tokens, not current context window tokens.
+# We track a "baseline" to calculate effective context usage since last reset.
+# Two reset conditions exist for different scenarios:
+#   1. Token DECREASE: After auto-compact, tokens drop. The new count IS actual context.
+#      → Reset baseline to 0 (trust the new token count)
+#   2. IMPOSSIBLE STATE: Effective tokens > context size. This can't happen in reality.
+#      → Reset baseline to CURRENT_TOKENS (assume fresh start, like /clear)
+
 CTX_TRACK_FILE="$HOME/.claude/ctx_track.json"
 if [ -f "$CTX_TRACK_FILE" ]; then
     CTX_DATA=$(cat "$CTX_TRACK_FILE" 2>/dev/null)
@@ -111,28 +118,44 @@ else
     CTX_DATA='{}'
 fi
 
+# Clean up sessions older than 7 days to prevent unbounded file growth
+CUTOFF_DATE=$(date -v-7d +%Y-%m-%d 2>/dev/null || date -d "-7 days" +%Y-%m-%d 2>/dev/null)
+if [ -n "$CUTOFF_DATE" ]; then
+    CTX_DATA=$(echo "$CTX_DATA" | jq --arg cutoff "$CUTOFF_DATE" '
+        with_entries(select(.value.updated == null or .value.updated >= $cutoff))
+    ')
+fi
+
 # Get previous state for this session
 PREV_TOKENS=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].last_tokens // 0')
 CTX_BASELINE=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].baseline // 0')
 CURRENT_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
 
-# Detect auto-compact: tokens can only decrease when compaction occurs
-# Any drop in tokens means compact just happened - reset baseline
+# Reset condition 1: Token DECREASE detected (auto-compact or /compact)
+# When Claude compacts context, the new token count represents actual usage.
+# Setting baseline=0 means: trust the new token count as real context usage.
 if [ "$PREV_TOKENS" -gt 0 ] && [ "$CURRENT_TOKENS" -lt "$PREV_TOKENS" ]; then
-    # Compact detected! Current tokens now reflect actual context usage
-    # Reset baseline since the new token count is accurate post-compact
     CTX_BASELINE=0
 fi
 
-# Calculate effective tokens (accounting for any accumulated baseline)
+# Reset condition 2: IMPOSSIBLE STATE (effective > context size)
+# This catches /clear scenarios where cumulative tokens stay high but context was cleared.
+# Setting baseline=CURRENT_TOKENS means: start fresh, effective becomes 0.
+EFFECTIVE_CHECK=$((CURRENT_TOKENS - CTX_BASELINE))
+if [ "$CONTEXT_SIZE" -gt 0 ] && [ "$EFFECTIVE_CHECK" -gt "$CONTEXT_SIZE" ]; then
+    CTX_BASELINE=$CURRENT_TOKENS
+fi
+
+# Calculate effective tokens (actual context usage since last reset)
 EFFECTIVE_TOKENS=$((CURRENT_TOKENS - CTX_BASELINE))
 [ "$EFFECTIVE_TOKENS" -lt 0 ] && EFFECTIVE_TOKENS=0
 
-# Update tracking state (atomic write)
+# Update tracking state with timestamp for cleanup (atomic write)
 CTX_DATA=$(echo "$CTX_DATA" | jq --arg sid "$SESSION_ID" \
     --argjson tokens "$CURRENT_TOKENS" \
     --argjson baseline "$CTX_BASELINE" \
-    '.[$sid] = {last_tokens: $tokens, baseline: $baseline}')
+    --arg today "$TODAY" \
+    '.[$sid] = {last_tokens: $tokens, baseline: $baseline, updated: $today}')
 echo "$CTX_DATA" > "$CTX_TRACK_FILE.tmp" && mv "$CTX_TRACK_FILE.tmp" "$CTX_TRACK_FILE"
 
 # Context calculation using effective tokens (adjusted for compaction)
