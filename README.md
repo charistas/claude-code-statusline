@@ -9,7 +9,7 @@ A beautiful, feature-rich statusline for Claude Code CLI with real-time context 
 ## Preview
 
 ```
-🤖 Opus [████████░░] 78% 📁 my-project 🌿 feature/auth 💰 cur $1.50 · 24h $45 · 7d $312 · 30d $1.2k 🕐 14:32
+🤖 Opus [████████░░] 78% 📁 my-project 🌿 feature/auth 💰 s $1.50 · d $45 · w $312 · m $1.2k · y $8.5k 🕐 14:32
 ```
 
 ## Features
@@ -19,7 +19,7 @@ A beautiful, feature-rich statusline for Claude Code CLI with real-time context 
 - **🚦 Traffic Light Colors** - Green (>50%), Yellow (25-50%), Red (<25%), Blinking (<10%)
 - **📁 Project Name** - Current project directory
 - **🌿 Git Branch** - Active git branch (when in a repo)
-- **💰 Cost Tracking** - Session, daily, weekly, and monthly cost accumulation
+- **💰 Cost Tracking** - Session, daily, weekly, monthly, and yearly cost tracking with persistent history
 - **🕐 Current Time** - Live clock display
 
 ## Installation
@@ -90,14 +90,30 @@ The statusline reads Claude Code's JSON input which includes context window info
 
 ### Cost Tracking
 
-Costs are tracked in `~/.claude/statusline_data.json`:
+Costs are displayed with compact labels:
 
-- **cur** - Current session cost
-- **24h** - Rolling 24-hour total
-- **7d** - Rolling 7-day total
-- **30d** - Rolling 30-day total
+| Label | Meaning | Source |
+|-------|---------|--------|
+| **s** | Session | Current session cost from Claude Code |
+| **d** | Day | Today's total (sum of all sessions) |
+| **w** | Week | Last 7 days |
+| **m** | Month | Last 30 days |
+| **y** | Year | Last 365 days |
 
-> **Note:** Costs shown are API-equivalent estimates. If you're on a Pro/Max subscription, these don't reflect actual charges.
+#### How It Works
+
+- **Today's cost** is tracked per-session in `~/.claude/statusline_data.json`
+- **Historical costs** (for w/m/y) are calculated from Claude Code's built-in `~/.claude/stats-cache.json` which tracks daily token usage per model
+- **Persistent history** is archived to our data file, so yearly totals remain accurate even after stats-cache rolls off older data (~30 days)
+
+#### Pricing Used
+
+Costs are estimated from output token usage:
+- Opus: $75 per million tokens
+- Sonnet: $15 per million tokens
+- Haiku: $4 per million tokens
+
+> **Note:** These are API-equivalent estimates. If you're on a Pro/Max subscription, these don't reflect actual charges.
 
 ## Customization
 
@@ -127,9 +143,30 @@ The output is built in the `BUILD OUTPUT` section. Reorder or remove sections as
 
 ## Data Storage
 
-| File | Purpose |
-|------|---------|
-| `~/.claude/statusline_data.json` | Cost tracking data (daily sessions, totals) |
+| File | Purpose | Owned By |
+|------|---------|----------|
+| `~/.claude/statusline_data.json` | Session costs, daily totals, persistent history | This script |
+| `~/.claude/stats-cache.json` | Token usage per day per model | Claude Code |
+
+### Data Structure
+
+```json
+{
+  "days": {
+    "2026-01-11": {
+      "sessions": { "session-id": 5.50 },
+      "total": 5.50
+    }
+  },
+  "history": {
+    "2026-01-10": 31.50,
+    "2026-01-09": 28.75
+  }
+}
+```
+
+- **days** - Today's session tracking (resets each day)
+- **history** - Archived daily costs (persists forever for yearly tracking)
 
 ### Reset Cost Data
 
@@ -138,6 +175,8 @@ To reset your cost tracking:
 ```bash
 rm ~/.claude/statusline_data.json
 ```
+
+> **Note:** This only resets the statusline's data. Claude Code's stats-cache.json is unaffected.
 
 ## Troubleshooting
 
