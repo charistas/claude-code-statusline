@@ -76,16 +76,33 @@ fi
 # ===== COST TRACKING =====
 # Initialize/load data file
 if [ ! -f "$DATA_FILE" ]; then
-    echo '{"days":{}}' > "$DATA_FILE"
+    echo '{"days":{},"history":{}}' > "$DATA_FILE"
 fi
 
 DATA=$(cat "$DATA_FILE")
 
-# Update today's session cost
-# Use max of all sessions (not sum) to avoid double-counting cumulative costs
-DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '
-    .days[$date].sessions[$sid] = $cost |
-    .days[$date].total = ([.days[$date].sessions[]] | max // 0)
+# Ensure history key exists (for upgrades from older versions)
+DATA=$(echo "$DATA" | jq 'if .history == null then .history = {} else . end')
+
+# Check if we've seen this session today - if not, record baseline
+# Baseline = session cost when first seen today (accounts for sessions spanning midnight)
+BASELINE=$(echo "$DATA" | jq -r --arg date "$TODAY" --arg sid "$SESSION_ID" '.days[$date].baselines[$sid] // "null"')
+
+if [ "$BASELINE" = "null" ]; then
+    # First time seeing this session today - current cost becomes baseline
+    DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '
+        .days[$date].baselines[$sid] = $cost
+    ')
+    BASELINE=$SESSION_COST
+fi
+
+# Today's contribution from this session = current cost - baseline
+SESSION_TODAY=$(echo "$SESSION_COST - $BASELINE" | bc)
+
+# Update session's contribution for today and recalculate total
+DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson contrib "$SESSION_TODAY" '
+    .days[$date].sessions[$sid] = $contrib |
+    .days[$date].total = ([.days[$date].sessions[]] | add // 0)
 ')
 
 # Save data
@@ -97,7 +114,7 @@ DAILY_COST=$(echo "$DATA" | jq --arg date "$TODAY" '.days[$date].total // 0')
 # ===== HISTORICAL COSTS FROM STATS-CACHE =====
 # Calculate cost from token usage in stats-cache.json
 # Pricing per 1M tokens (output): Opus=$75, Sonnet=$15, Haiku=$4
-calc_historical_cost() {
+calc_cost_from_stats() {
     local target_date="$1"
     if [ ! -f "$STATS_CACHE" ]; then
         echo "0"
@@ -123,25 +140,68 @@ calc_historical_cost() {
     echo "$cost"
 }
 
-# Weekly: today (from sessions) + last 6 days (from stats-cache)
+# Archive recent days from stats-cache to our persistent history
+# This runs on each invocation but only writes if there's new data
+HISTORY_UPDATED=false
+for i in {1..35}; do
+    DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
+    # Check if this date is already in our history
+    EXISTING=$(echo "$DATA" | jq -r --arg d "$DATE" '.history[$d] // "null"')
+    if [ "$EXISTING" = "null" ]; then
+        # Not in history - try to get from stats-cache
+        COST=$(calc_cost_from_stats "$DATE")
+        if [ "$COST" != "0" ] && [ -n "$COST" ]; then
+            DATA=$(echo "$DATA" | jq --arg d "$DATE" --argjson c "$COST" '.history[$d] = $c')
+            HISTORY_UPDATED=true
+        fi
+    fi
+done
+
+# Save if history was updated
+if [ "$HISTORY_UPDATED" = true ]; then
+    echo "$DATA" > "$DATA_FILE"
+fi
+
+# Get historical cost - first check our history, then fall back to stats-cache
+get_historical_cost() {
+    local target_date="$1"
+    # First check our persistent history
+    local cost=$(echo "$DATA" | jq -r --arg d "$target_date" '.history[$d] // "null"')
+    if [ "$cost" != "null" ]; then
+        echo "$cost"
+        return
+    fi
+    # Fall back to stats-cache for recent days not yet archived
+    calc_cost_from_stats "$target_date"
+}
+
+# Weekly: today (from sessions) + last 6 days (from history/stats-cache)
 WEEKLY_COST=$DAILY_COST
 for i in {1..6}; do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    DAY_COST=$(calc_historical_cost "$DATE")
+    DAY_COST=$(get_historical_cost "$DATE")
     WEEKLY_COST=$(echo "$WEEKLY_COST + $DAY_COST" | bc)
 done
 
-# Monthly: today (from sessions) + last 29 days (from stats-cache)
+# Monthly: today (from sessions) + last 29 days (from history/stats-cache)
 MONTHLY_COST=$DAILY_COST
 for i in {1..29}; do
     DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    DAY_COST=$(calc_historical_cost "$DATE")
+    DAY_COST=$(get_historical_cost "$DATE")
     MONTHLY_COST=$(echo "$MONTHLY_COST + $DAY_COST" | bc)
 done
+
+# Yearly: sum all history entries from last 365 days + today
+YEAR_AGO=$(date -v-365d +%Y-%m-%d 2>/dev/null || date -d "-365 days" +%Y-%m-%d 2>/dev/null)
+YEARLY_HISTORY=$(echo "$DATA" | jq --arg cutoff "$YEAR_AGO" '
+    [.history | to_entries[] | select(.key >= $cutoff) | .value] | add // 0
+')
+YEARLY_COST=$(echo "$DAILY_COST + $YEARLY_HISTORY" | bc)
 
 # Format costs
 SESSION_FMT=$(printf "%.2f" "$SESSION_COST")
 DAILY_FMT=$(printf "%.0f" "$DAILY_COST")
+YEARLY_FMT=$(printf "%.0f" "$YEARLY_COST")
 WEEKLY_FMT=$(printf "%.0f" "$WEEKLY_COST")
 MONTHLY_FMT=$(printf "%.0f" "$MONTHLY_COST")
 
@@ -164,8 +224,8 @@ if [ -n "$GIT_BRANCH" ]; then
     OUTPUT+=" ${GREEN}🌿 ${GIT_BRANCH}${RESET}"
 fi
 
-# 💰 Costs: session / today / 7d / 30d
-OUTPUT+=" ${DIM}💰 s${RESET} ${YELLOW}\$${SESSION_FMT}${RESET} ${DIM}· d${RESET} ${MAGENTA}\$${DAILY_FMT}${RESET} ${DIM}· w${RESET} ${MAGENTA}\$${WEEKLY_FMT}${RESET} ${DIM}· m${RESET} ${MAGENTA}\$${MONTHLY_FMT}${RESET}"
+# 💰 Costs: s=session, d=day, w=week, m=month, y=year
+OUTPUT+=" ${DIM}💰 s${RESET} ${YELLOW}\$${SESSION_FMT}${RESET} ${DIM}· d${RESET} ${MAGENTA}\$${DAILY_FMT}${RESET} ${DIM}· w${RESET} ${MAGENTA}\$${WEEKLY_FMT}${RESET} ${DIM}· m${RESET} ${MAGENTA}\$${MONTHLY_FMT}${RESET} ${DIM}· y${RESET} ${MAGENTA}\$${YEARLY_FMT}${RESET}"
 
 # 🕐 Time
 OUTPUT+=" ${DIM}🕐 ${CURRENT_TIME}${RESET}"
