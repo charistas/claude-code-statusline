@@ -99,11 +99,49 @@ elif [ -d ".git" ]; then
     GIT_BRANCH=$(git branch --show-current 2>/dev/null)
 fi
 
-# Context calculation (uses total tokens, not per-request current_usage)
+# ===== AUTO-COMPACT DETECTION =====
+# Load previous token state for this session (need data file early for this)
+CTX_TRACK_FILE="$HOME/.claude/ctx_track.json"
+if [ -f "$CTX_TRACK_FILE" ]; then
+    CTX_DATA=$(cat "$CTX_TRACK_FILE" 2>/dev/null)
+    if [ -z "$CTX_DATA" ] || ! echo "$CTX_DATA" | jq empty 2>/dev/null; then
+        CTX_DATA='{}'
+    fi
+else
+    CTX_DATA='{}'
+fi
+
+# Get previous state for this session
+PREV_TOKENS=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].last_tokens // 0')
+CTX_BASELINE=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].baseline // 0')
+CURRENT_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
+
+# Detect auto-compact: tokens can only decrease when compaction occurs
+# Any drop in tokens means compact just happened - reset baseline
+if [ "$PREV_TOKENS" -gt 0 ] && [ "$CURRENT_TOKENS" -lt "$PREV_TOKENS" ]; then
+    # Compact detected! Current tokens now reflect actual context usage
+    # Reset baseline since the new token count is accurate post-compact
+    CTX_BASELINE=0
+fi
+
+# Calculate effective tokens (accounting for any accumulated baseline)
+EFFECTIVE_TOKENS=$((CURRENT_TOKENS - CTX_BASELINE))
+[ "$EFFECTIVE_TOKENS" -lt 0 ] && EFFECTIVE_TOKENS=0
+
+# Update tracking state (atomic write)
+CTX_DATA=$(echo "$CTX_DATA" | jq --arg sid "$SESSION_ID" \
+    --argjson tokens "$CURRENT_TOKENS" \
+    --argjson baseline "$CTX_BASELINE" \
+    '.[$sid] = {last_tokens: $tokens, baseline: $baseline}')
+echo "$CTX_DATA" > "$CTX_TRACK_FILE.tmp" && mv "$CTX_TRACK_FILE.tmp" "$CTX_TRACK_FILE"
+
+# Context calculation using effective tokens (adjusted for compaction)
 if [ "$CONTEXT_SIZE" != "0" ]; then
-    CURRENT=$((TOTAL_INPUT + TOTAL_OUTPUT))
-    REMAINING=$((CONTEXT_SIZE - CURRENT))
+    REMAINING=$((CONTEXT_SIZE - EFFECTIVE_TOKENS))
     PERCENT=$((REMAINING * 100 / CONTEXT_SIZE))
+    # Clamp to valid range
+    [ "$PERCENT" -lt 0 ] && PERCENT=0
+    [ "$PERCENT" -gt 100 ] && PERCENT=100
 else
     PERCENT=100
 fi
