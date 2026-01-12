@@ -80,7 +80,8 @@ MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 SESSION_ID=$(echo "$input" | jq -r '.session_id // "unknown"')
 SESSION_COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 CONTEXT_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
-USAGE=$(echo "$input" | jq '.context_window.current_usage // null')
+TOTAL_INPUT=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
+TOTAL_OUTPUT=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
 PROJECT_DIR=$(echo "$input" | jq -r '.workspace.project_dir // .workspace.current_dir // ""')
 
 # Get project name from path
@@ -98,9 +99,9 @@ elif [ -d ".git" ]; then
     GIT_BRANCH=$(git branch --show-current 2>/dev/null)
 fi
 
-# Context calculation
-if [ "$USAGE" != "null" ] && [ "$CONTEXT_SIZE" != "0" ]; then
-    CURRENT=$(echo "$USAGE" | jq '(.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)')
+# Context calculation (uses total tokens, not per-request current_usage)
+if [ "$CONTEXT_SIZE" != "0" ]; then
+    CURRENT=$((TOTAL_INPUT + TOTAL_OUTPUT))
     REMAINING=$((CONTEXT_SIZE - CURRENT))
     PERCENT=$((REMAINING * 100 / CONTEXT_SIZE))
 else
