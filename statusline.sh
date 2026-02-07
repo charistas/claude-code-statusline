@@ -57,6 +57,10 @@ write_json_file() {
     fi
 }
 
+# ===== INPUT VALIDATION =====
+validate_int() { local v="${1:-0}"; [[ "$v" =~ ^-?[0-9]+$ ]] && echo "$v" || echo "0"; }
+validate_num() { local v="${1:-0}"; [[ "$v" =~ ^-?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]] && echo "$v" || echo "0"; }
+
 # ===== READ INPUT =====
 input=$(cat)
 
@@ -82,6 +86,10 @@ SESSION_COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 CONTEXT_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
 TOTAL_INPUT=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
 TOTAL_OUTPUT=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
+SESSION_COST=$(validate_num "$SESSION_COST")
+CONTEXT_SIZE=$(validate_int "$CONTEXT_SIZE")
+TOTAL_INPUT=$(validate_int "$TOTAL_INPUT")
+TOTAL_OUTPUT=$(validate_int "$TOTAL_OUTPUT")
 PROJECT_DIR=$(echo "$input" | jq -r '.workspace.project_dir // .workspace.current_dir // ""')
 
 # Get project name from path
@@ -108,6 +116,7 @@ fi
 #   2. IMPOSSIBLE STATE: Effective tokens > context size. This can't happen in reality.
 #      → Reset baseline to CURRENT_TOKENS (assume fresh start, like /clear)
 
+# Protected by script-wide flock (lines 39-43) when available
 CTX_TRACK_FILE="$HOME/.claude/ctx_track.json"
 if [ -f "$CTX_TRACK_FILE" ]; then
     CTX_DATA=$(cat "$CTX_TRACK_FILE" 2>/dev/null)
@@ -129,6 +138,8 @@ fi
 # Get previous state for this session
 PREV_TOKENS=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].last_tokens // 0')
 CTX_BASELINE=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].baseline // 0')
+PREV_TOKENS=$(validate_int "$PREV_TOKENS")
+CTX_BASELINE=$(validate_int "$CTX_BASELINE")
 CURRENT_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
 
 # Reset condition 1: Token DECREASE detected (auto-compact or /compact)
@@ -156,7 +167,7 @@ CTX_DATA=$(echo "$CTX_DATA" | jq --arg sid "$SESSION_ID" \
     --argjson baseline "$CTX_BASELINE" \
     --arg today "$TODAY" \
     '.[$sid] = {last_tokens: $tokens, baseline: $baseline, updated: $today}')
-echo "$CTX_DATA" > "$CTX_TRACK_FILE.tmp" && mv "$CTX_TRACK_FILE.tmp" "$CTX_TRACK_FILE"
+write_json_file "$CTX_TRACK_FILE" "$CTX_DATA"
 
 # Context calculation using effective tokens (adjusted for compaction)
 if [ "$CONTEXT_SIZE" != "0" ]; then
@@ -198,10 +209,10 @@ if [ -f "$DATA_FILE" ]; then
     DATA=$(cat "$DATA_FILE")
     # Validate JSON - reinitialize if corrupt or empty
     if [ -z "$DATA" ] || ! echo "$DATA" | jq empty 2>/dev/null; then
-        DATA='{"days":{},"history":{}}'
+        DATA='{"history":{}}'
     fi
 else
-    DATA='{"days":{},"history":{}}'
+    DATA='{"history":{}}'
 fi
 
 # Ensure history key exists (for upgrades from older versions)
@@ -220,6 +231,7 @@ JQ_COST_CALC='
     def sonnet_cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 };
     def haiku_cost: { input: 1, output: 5, cache_read: 0.1, cache_write: 1.25 };
 
+    # Substring match on model ID; falls back to Sonnet pricing for unknown models
     def get_pricing($model):
         if ($model | test("opus"; "i")) then opus_cost
         elif ($model | test("sonnet"; "i")) then sonnet_cost
@@ -227,7 +239,9 @@ JQ_COST_CALC='
         else sonnet_cost
         end;
 
-    # Filter valid entries with usage, deduplicate by uuid
+    # Filter valid entries with usage, deduplicate by uuid.
+    # Excludes sidechain (tool sub-conversations) and API errors — these are either
+    # not billed separately or represent failed requests with no token consumption.
     [.[] | select(
         .message.usage and
         (.isSidechain | not) and
@@ -270,9 +284,11 @@ calc_daily_cost_from_jsonl() {
     # Pre-filter with grep for target date (much faster than jq filtering all data)
     # Use jq -R to read as raw strings, then parse with try/catch to skip malformed lines
     local result
+    # try/catch handles partially-written lines during concurrent Claude Code writes
     local jq_filter='[inputs | try fromjson catch empty]'
     if [ "$target_date" = "$TODAY" ]; then
         # For today: only scan recently modified files, grep for date, then jq
+        # -mtime 0 = modified within last 24h (not since midnight); grep compensates
         result=$(find "$CLAUDE_PROJECTS" -name "*.jsonl" -type f -mtime 0 2>/dev/null \
             -exec grep -h "\"timestamp\":\"${target_date}T" {} + 2>/dev/null | \
             jq -Rn "$jq_filter" 2>/dev/null | jq "$JQ_COST_CALC" 2>/dev/null)
@@ -283,13 +299,15 @@ calc_daily_cost_from_jsonl() {
             jq -Rn "$jq_filter" 2>/dev/null | jq "$JQ_COST_CALC" 2>/dev/null)
     fi
 
-    echo "${result:-0}"
+    validate_num "${result:-0}"
 }
 
 # Get cached cost for a date from history
 get_cached_cost() {
     local target_date="$1"
-    echo "$DATA" | jq -r --arg d "$target_date" '.history[$d] // "0"'
+    local cost
+    cost=$(echo "$DATA" | jq -r --arg d "$target_date" '.history[$d] // 0')
+    validate_num "$cost"
 }
 
 # Pre-cache costs for a range of past days (call before loops)
@@ -311,38 +329,13 @@ precache_costs() {
             cost=$(calc_daily_cost_from_jsonl "$date")
 
             # Validate cost is a valid number before storing
-            if [[ "$cost" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+            if [[ "$cost" =~ ^[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]]; then
                 DATA=$(echo "$DATA" | jq --arg d "$date" --argjson c "${cost}" '.history[$d] = $c')
                 HISTORY_UPDATED=true
             fi
         fi
     done
 }
-
-# ===== SESSION BASELINE TRACKING =====
-# Check if we've seen this session today - if not, record baseline
-# Baseline = session cost when first seen today (accounts for sessions spanning midnight)
-BASELINE=$(echo "$DATA" | jq -r --arg date "$TODAY" --arg sid "$SESSION_ID" '.days[$date].baselines[$sid] // "null"')
-
-if [ "$BASELINE" = "null" ]; then
-    # First time seeing this session today - current cost becomes baseline
-    DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson cost "$SESSION_COST" '
-        .days[$date].baselines[$sid] = $cost
-    ')
-    BASELINE=$SESSION_COST
-fi
-
-# Today's contribution from this session = current cost - baseline
-SESSION_TODAY=$(echo "$SESSION_COST - $BASELINE" | bc)
-
-# Update session's contribution for today and recalculate total
-DATA=$(echo "$DATA" | jq --arg date "$TODAY" --arg sid "$SESSION_ID" --argjson contrib "$SESSION_TODAY" '
-    .days[$date].sessions[$sid] = $contrib |
-    .days[$date].total = ([.days[$date].sessions[]] | add // 0)
-')
-
-# Save session data using atomic write
-write_json_file "$DATA_FILE" "$DATA"
 
 # ===== CALCULATE COSTS =====
 # Daily cost (today) - calculate fresh from JSONL for accuracy
@@ -384,6 +377,7 @@ YEAR_START="${TODAY%%-*}-01-01"
 YEARLY_HISTORY=$(echo "$DATA" | jq --arg cutoff "$YEAR_START" --arg today "$TODAY" '
     [.history | to_entries[] | select(.key >= $cutoff and .key != $today) | .value] | add // 0
 ')
+YEARLY_HISTORY=$(validate_num "$YEARLY_HISTORY")
 YEARLY_COST=$(echo "$DAILY_COST + $YEARLY_HISTORY" | bc)
 
 # Save if history was updated with newly calculated past days
