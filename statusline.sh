@@ -81,15 +81,8 @@ DIM="\033[90m"
 
 # Parse input
 MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-SESSION_ID=$(echo "$input" | jq -r '.session_id // "unknown"')
 SESSION_COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-CONTEXT_SIZE=$(echo "$input" | jq -r '.context_window.context_window_size // 0')
-TOTAL_INPUT=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
-TOTAL_OUTPUT=$(echo "$input" | jq -r '.context_window.total_output_tokens // 0')
 SESSION_COST=$(validate_num "$SESSION_COST")
-CONTEXT_SIZE=$(validate_int "$CONTEXT_SIZE")
-TOTAL_INPUT=$(validate_int "$TOTAL_INPUT")
-TOTAL_OUTPUT=$(validate_int "$TOTAL_OUTPUT")
 PROJECT_DIR=$(echo "$input" | jq -r '.workspace.project_dir // .workspace.current_dir // ""')
 
 # Get project name from path
@@ -107,78 +100,13 @@ elif [ -d ".git" ]; then
     GIT_BRANCH=$(git branch --show-current 2>/dev/null)
 fi
 
-# ===== CONTEXT TRACKING & RESET DETECTION =====
-# Claude Code reports cumulative session tokens, not current context window tokens.
-# We track a "baseline" to calculate effective context usage since last reset.
-# Two reset conditions exist for different scenarios:
-#   1. Token DECREASE: After auto-compact, tokens drop. The new count IS actual context.
-#      → Reset baseline to 0 (trust the new token count)
-#   2. IMPOSSIBLE STATE: Effective tokens > context size. This can't happen in reality.
-#      → Reset baseline to CURRENT_TOKENS (assume fresh start, like /clear)
-
-# Protected by script-wide flock (lines 39-43) when available
-CTX_TRACK_FILE="$HOME/.claude/ctx_track.json"
-if [ -f "$CTX_TRACK_FILE" ]; then
-    CTX_DATA=$(cat "$CTX_TRACK_FILE" 2>/dev/null)
-    if [ -z "$CTX_DATA" ] || ! echo "$CTX_DATA" | jq empty 2>/dev/null; then
-        CTX_DATA='{}'
-    fi
-else
-    CTX_DATA='{}'
-fi
-
-# Clean up sessions older than 7 days to prevent unbounded file growth
-CUTOFF_DATE=$(date -v-7d +%Y-%m-%d 2>/dev/null || date -d "-7 days" +%Y-%m-%d 2>/dev/null)
-if [ -n "$CUTOFF_DATE" ]; then
-    CTX_DATA=$(echo "$CTX_DATA" | jq --arg cutoff "$CUTOFF_DATE" '
-        with_entries(select(.value.updated == null or .value.updated >= $cutoff))
-    ')
-fi
-
-# Get previous state for this session
-PREV_TOKENS=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].last_tokens // 0')
-CTX_BASELINE=$(echo "$CTX_DATA" | jq -r --arg sid "$SESSION_ID" '.[$sid].baseline // 0')
-PREV_TOKENS=$(validate_int "$PREV_TOKENS")
-CTX_BASELINE=$(validate_int "$CTX_BASELINE")
-CURRENT_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
-
-# Reset condition 1: Token DECREASE detected (auto-compact or /compact)
-# When Claude compacts context, the new token count represents actual usage.
-# Setting baseline=0 means: trust the new token count as real context usage.
-if [ "$PREV_TOKENS" -gt 0 ] && [ "$CURRENT_TOKENS" -lt "$PREV_TOKENS" ]; then
-    CTX_BASELINE=0
-fi
-
-# Reset condition 2: IMPOSSIBLE STATE (effective > context size)
-# This catches /clear scenarios where cumulative tokens stay high but context was cleared.
-# Setting baseline=CURRENT_TOKENS means: start fresh, effective becomes 0.
-EFFECTIVE_CHECK=$((CURRENT_TOKENS - CTX_BASELINE))
-if [ "$CONTEXT_SIZE" -gt 0 ] && [ "$EFFECTIVE_CHECK" -gt "$CONTEXT_SIZE" ]; then
-    CTX_BASELINE=$CURRENT_TOKENS
-fi
-
-# Calculate effective tokens (actual context usage since last reset)
-EFFECTIVE_TOKENS=$((CURRENT_TOKENS - CTX_BASELINE))
-[ "$EFFECTIVE_TOKENS" -lt 0 ] && EFFECTIVE_TOKENS=0
-
-# Update tracking state with timestamp for cleanup (atomic write)
-CTX_DATA=$(echo "$CTX_DATA" | jq --arg sid "$SESSION_ID" \
-    --argjson tokens "$CURRENT_TOKENS" \
-    --argjson baseline "$CTX_BASELINE" \
-    --arg today "$TODAY" \
-    '.[$sid] = {last_tokens: $tokens, baseline: $baseline, updated: $today}')
-write_json_file "$CTX_TRACK_FILE" "$CTX_DATA"
-
-# Context calculation using effective tokens (adjusted for compaction)
-if [ "$CONTEXT_SIZE" != "0" ]; then
-    REMAINING=$((CONTEXT_SIZE - EFFECTIVE_TOKENS))
-    PERCENT=$((REMAINING * 100 / CONTEXT_SIZE))
-    # Clamp to valid range
-    [ "$PERCENT" -lt 0 ] && PERCENT=0
-    [ "$PERCENT" -gt 100 ] && PERCENT=100
-else
-    PERCENT=100
-fi
+# ===== CONTEXT PERCENTAGE =====
+# Claude Code provides a pre-calculated used_percentage that reflects actual context state,
+# handling compaction, /clear, and /compact internally. No manual baseline tracking needed.
+USED_PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
+PERCENT=$((100 - USED_PCT))
+[ "$PERCENT" -lt 0 ] && PERCENT=0
+[ "$PERCENT" -gt 100 ] && PERCENT=100
 
 # Progress bar (10 chars)
 FILLED=$((PERCENT / 10))
