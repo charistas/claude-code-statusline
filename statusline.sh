@@ -58,7 +58,6 @@ write_json_file() {
 }
 
 # ===== INPUT VALIDATION =====
-validate_int() { local v="${1:-0}"; [[ "$v" =~ ^-?[0-9]+$ ]] && echo "$v" || echo "0"; }
 validate_num() { local v="${1:-0}"; [[ "$v" =~ ^-?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]] && echo "$v" || echo "0"; }
 
 # ===== READ INPUT =====
@@ -79,11 +78,19 @@ MAGENTA="\033[35m"
 BLUE="\033[34m"
 DIM="\033[90m"
 
-# Parse input
-MODEL=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-SESSION_COST=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
+# Parse all input fields in a single jq call
+{
+    IFS= read -r MODEL
+    IFS= read -r SESSION_COST
+    IFS= read -r PROJECT_DIR
+    IFS= read -r USED_PCT
+} <<< "$(echo "$input" | jq -r '
+    (.model.display_name // "Claude"),
+    (.cost.total_cost_usd // 0 | tostring),
+    (.workspace.project_dir // .workspace.current_dir // ""),
+    (.context_window.used_percentage // 0 | floor | tostring)
+')"
 SESSION_COST=$(validate_num "$SESSION_COST")
-PROJECT_DIR=$(echo "$input" | jq -r '.workspace.project_dir // .workspace.current_dir // ""')
 
 # Get project name from path
 if [ -n "$PROJECT_DIR" ]; then
@@ -101,9 +108,7 @@ elif [ -d ".git" ]; then
 fi
 
 # ===== CONTEXT PERCENTAGE =====
-# Claude Code provides a pre-calculated used_percentage that reflects actual context state,
-# handling compaction, /clear, and /compact internally. No manual baseline tracking needed.
-USED_PCT=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
+# Claude Code provides a pre-calculated used_percentage — no manual baseline tracking needed.
 PERCENT=$((100 - USED_PCT))
 [ "$PERCENT" -lt 0 ] && PERCENT=0
 [ "$PERCENT" -gt 100 ] && PERCENT=100
@@ -238,6 +243,22 @@ get_cached_cost() {
     validate_num "$cost"
 }
 
+# Sum cached costs for past N days in a single jq call
+sum_cached_costs() {
+    local days_back="$1"
+    [ "$days_back" -le 0 ] && { echo "0"; return; }
+    local date_args=""
+    for ((i=1; i<=days_back; i++)); do
+        local d
+        d=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
+        [ -z "$d" ] && continue
+        [ -n "$date_args" ] && date_args+=","
+        date_args+="\"$d\""
+    done
+    [ -z "$date_args" ] && { echo "0"; return; }
+    echo "$DATA" | jq "[.history[$date_args] // 0] | add // 0"
+}
+
 # Pre-cache costs for a range of past days (call before loops)
 precache_costs() {
     local days_back="$1"
@@ -282,23 +303,9 @@ MAX_LOOKBACK=$DAYS_SINCE_FIRST
 [ "$DAYS_SINCE_MONDAY" -gt "$MAX_LOOKBACK" ] && MAX_LOOKBACK=$DAYS_SINCE_MONDAY
 precache_costs "$MAX_LOOKBACK"
 
-# Calculate weekly cost
-WEEKLY_COST=$DAILY_COST
-for ((i=1; i<=DAYS_SINCE_MONDAY; i++)); do
-    DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    [ -z "$DATE" ] && continue
-    DAY_COST=$(get_cached_cost "$DATE")
-    WEEKLY_COST=$(echo "$WEEKLY_COST + $DAY_COST" | bc)
-done
-
-# Calculate monthly cost
-MONTHLY_COST=$DAILY_COST
-for ((i=1; i<=DAYS_SINCE_FIRST; i++)); do
-    DATE=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-${i} days" +%Y-%m-%d 2>/dev/null)
-    [ -z "$DATE" ] && continue
-    DAY_COST=$(get_cached_cost "$DATE")
-    MONTHLY_COST=$(echo "$MONTHLY_COST + $DAY_COST" | bc)
-done
+# Calculate weekly and monthly costs (single jq + bc per period)
+WEEKLY_COST=$(echo "$DAILY_COST + $(sum_cached_costs "$DAYS_SINCE_MONDAY")" | bc)
+MONTHLY_COST=$(echo "$DAILY_COST + $(sum_cached_costs "$DAYS_SINCE_FIRST")" | bc)
 
 # Yearly: Sum from history (excluding today) + today's cost
 YEAR_START="${TODAY%%-*}-01-01"
@@ -310,6 +317,10 @@ YEARLY_COST=$(echo "$DAILY_COST + $YEARLY_HISTORY" | bc)
 
 # Save if history was updated with newly calculated past days
 if [ "$HISTORY_UPDATED" = true ]; then
+    # Prune entries from before the current year on save
+    DATA=$(echo "$DATA" | jq --arg cutoff "${TODAY%%-*}-01-01" '
+        .history |= with_entries(select(.key >= $cutoff))
+    ')
     write_json_file "$DATA_FILE" "$DATA"
 fi
 
